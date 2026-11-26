@@ -10,6 +10,9 @@ This is the **core** that every participant runs. It maintains its own copy of t
 - ECDSA wallet (secp256k1) with address generation
 - Transaction creation + signature verification
 - Proof-of-Work mining
+- Difficulty is recalculated after every block using the immediately preceding block interval; peers reject blocks whose difficulty does not match the same rule
+  - Difficulty is smoothly retargeted from the immediately preceding block interval. The adjustment is damped and capped at 0.25 difficulty units per block (at most 2x harder/easier per block), avoiding abrupt 16x jumps.
+  - Each block stores its parent timestamp in its hashed header, so this per-block rule continues working after historical blocks are pruned.
 - Longest-chain rule
 - Automatic peer discovery via the Discovery Service
 - Basic P2P block & transaction propagation
@@ -51,7 +54,8 @@ The node will:
 | `NETWORK_SECRET` | Shared secret (must match discovery service)     |
 | `PUBLIC_URL`     | Optional public URL override; Render auto-detects `RENDER_EXTERNAL_URL` |
 | `HTTP_PORT`      | Port for the API (default 8332)                  |
-| `DIFFICULTY`     | Leading zeros required (default 4)               |
+| `INITIAL_DIFFICULTY` | Starting difficulty units (default 1.0; fractional values supported) |
+| `BLOCK_TIME_TARGET` | Target interval between blocks in seconds (default 120) |
 | `BLOCK_REWARD`   | Coinbase reward (default 50)                     |
 
 ## Browser interface
@@ -112,7 +116,7 @@ blockchain-node/
 ## Next Steps (planned)
 
 - Full transaction/block detail pages and address history
-- Dynamic difficulty adjustment
+- Per-block dynamic difficulty adjustment (recalculated and consensus-validated for every new block)
 - Cumulative chainwork
 - Proper fork handling / reorgs
 - Coinbase maturity enforcement
