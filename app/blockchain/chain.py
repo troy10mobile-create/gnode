@@ -4,6 +4,8 @@ import hashlib
 import json
 import math
 import os
+import time
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
@@ -12,7 +14,7 @@ from app.blockchain.models import Block, Transaction
 from app.config import (
     DATA_DIR, INITIAL_DIFFICULTY, INITIAL_BLOCK_REWARD,
     REWARD_REDUCTION_INTERVAL, REWARD_REDUCTION_FACTOR,
-    BLOCK_TIME_TARGET, DIFFICULTY_ADJUST_INTERVAL, MIN_DIFFICULTY,
+    BLOCK_TIME_TARGET, MIN_DIFFICULTY,
     GENESIS_TIMESTAMP, GENESIS_PREV_HASH, PRUNE_INTERVAL, ARCHIVE_HISTORY,
     MIN_SNAPSHOT_BALANCE,
 )
@@ -212,25 +214,62 @@ class Blockchain:
     def is_pruning_height(self, height: int) -> bool:
         return height > 0 and height % PRUNE_INTERVAL == 0
 
-    def get_current_difficulty(self) -> int:
+    def get_current_difficulty(self) -> float:
         return INITIAL_DIFFICULTY if len(self.chain) < 2 else self.last_block.difficulty
 
-    def calculate_next_difficulty(self) -> int:
-        height = self.height
-        if height < DIFFICULTY_ADJUST_INTERVAL or (height + 1) % DIFFICULTY_ADJUST_INTERVAL != 0:
-            return self.get_current_difficulty()
-        lookback = min(DIFFICULTY_ADJUST_INTERVAL, len(self.chain) - 1)
-        if lookback < 2:
-            return self.get_current_difficulty()
-        recent = self.chain[-lookback:]
-        elapsed = recent[-1].timestamp - recent[0].timestamp
-        expected = BLOCK_TIME_TARGET * (lookback - 1)
-        old = self.last_block.difficulty
-        if elapsed <= 0 or elapsed < expected * 0.8:
-            return old + 1
-        if elapsed > expected * 1.2:
-            return max(MIN_DIFFICULTY, old - 1)
-        return old
+    @staticmethod
+    def _difficulty_after_parent(parent: Block, prior: Optional[Block] = None) -> float:
+        """Smoothly retarget after EVERY block, using the preceding interval.
+
+        Difficulty uses hexadecimal-zero equivalents but supports fractions.
+        A +0.25 change doubles expected work. Retargeting is damped and capped
+        at +/-0.25 per block (at most 2x harder/easier), avoiding abrupt 16x
+        jumps from the old integer-only scheme.
+
+        previous_timestamp is carried in each block so pruning does not erase
+        the interval needed for the next retarget. Genesis's historical date
+        is excluded from the first adjustment.
+        """
+        old = float(parent.difficulty)
+        if parent.index <= 1:
+            return max(MIN_DIFFICULTY, round(old, 6))
+
+        parent_time = parent.previous_timestamp
+        if parent_time is None and prior is not None and prior.index + 1 == parent.index:
+            parent_time = prior.timestamp
+        if parent_time is None:
+            return max(MIN_DIFFICULTY, round(old, 6))
+
+        elapsed = float(parent.timestamp) - float(parent_time)
+        if elapsed <= 0:
+            adjustment = 0.25
+        else:
+            with localcontext() as ctx:
+                ctx.prec = 50
+                ratio = Decimal(str(BLOCK_TIME_TARGET)) / Decimal(str(elapsed))
+                raw = ratio.ln() / Decimal(16).ln()
+                adjustment = float(raw * Decimal("0.25"))
+        adjustment = max(-0.25, min(0.25, adjustment))
+        return max(MIN_DIFFICULTY, round(old + adjustment, 6))
+
+    @staticmethod
+    def meets_difficulty(block_hash: str, difficulty: float) -> bool:
+        """Check proof of work against a precise 256-bit target."""
+        try:
+            difficulty = float(difficulty)
+            if not math.isfinite(difficulty) or difficulty < MIN_DIFFICULTY:
+                return False
+            with localcontext() as ctx:
+                ctx.prec = 100
+                scale = Decimal(16) ** Decimal(str(round(difficulty, 6)))
+                target = int(Decimal((1 << 256) - 1) / scale)
+            return int(block_hash, 16) <= target
+        except (ValueError, ArithmeticError):
+            return False
+
+    def calculate_next_difficulty(self) -> float:
+        prior = self.chain[-2] if len(self.chain) >= 2 else None
+        return self._difficulty_after_parent(self.last_block, prior)
 
     # ---------------------------- State engine ----------------------------
     @staticmethod
@@ -320,14 +359,26 @@ class Blockchain:
 
         next_difficulty = self.calculate_next_difficulty()
         block = Block(index=next_height, timestamp=datetime.now(timezone.utc).timestamp(),
+                      previous_timestamp=self.last_block.timestamp,
                       transactions=transactions, previous_hash=self.last_block.hash,
                       difficulty=next_difficulty, snapshot_root=snapshot_root,
                       snapshot_accounts=len(resulting_state) if snapshot_root else 0,
                       cumulative_work=self.chain_work() + self.block_work_for_difficulty(next_difficulty))
-        target = "0" * block.difficulty
+        last_timestamp_refresh = time.monotonic()
         while True:
+            # Keep the block timestamp close to when the proof is actually
+            # found. The timestamp is part of the hash, so changing it simply
+            # starts searching a new header/nonce space; nonce remains valid
+            # as a search counter.
+            now_mono = time.monotonic()
+            if now_mono - last_timestamp_refresh >= 5:
+                block.timestamp = max(
+                    datetime.now(timezone.utc).timestamp(),
+                    block.previous_timestamp + 0.001,
+                )
+                last_timestamp_refresh = now_mono
             block.compute_hash()
-            if block.hash.startswith(target):
+            if self.meets_difficulty(block.hash, block.difficulty):
                 break
             block.nonce += 1
 
@@ -355,8 +406,10 @@ class Blockchain:
 
     # -------------------------- Validation / sync -------------------------
     @staticmethod
-    def block_work_for_difficulty(difficulty: int) -> int:
-        return 16 ** max(0, difficulty)
+    def block_work_for_difficulty(difficulty: float) -> int:
+        with localcontext() as ctx:
+            ctx.prec = 100
+            return int(Decimal(16) ** Decimal(str(round(float(difficulty), 6))))
 
     @classmethod
     def block_work(cls, block: Block) -> int:
@@ -376,7 +429,7 @@ class Blockchain:
             return False
         prev = chain[0]
         last_height = 0
-        for current in chain[1:]:
+        for position, current in enumerate(chain[1:], start=1):
             if current.index <= last_height:
                 return False
             is_checkpoint = bool(current.snapshot_root) or any(tx.sender == "PRUNE" for tx in current.transactions)
@@ -385,7 +438,19 @@ class Blockchain:
                     return False
             elif not (prev.index == 0 and is_checkpoint):
                 return False
-            if current.compute_hash() != current.hash or not current.hash.startswith("0" * current.difficulty):
+            if current.index == prev.index + 1 and current.previous_timestamp is not None:
+                # New-format blocks carry their parent's timestamp and are
+                # checked against the per-block retarget rule. Older blocks
+                # without this field remain readable during network upgrade.
+                if (current.previous_timestamp != prev.timestamp
+                        or current.timestamp <= prev.timestamp
+                        or current.timestamp > time.time() + 7200):
+                    return False
+                prior = chain[position - 2] if position >= 2 else None
+                expected_difficulty = self._difficulty_after_parent(prev, prior)
+                if not math.isclose(float(current.difficulty), expected_difficulty, rel_tol=0.0, abs_tol=1e-6):
+                    return False
+            if current.compute_hash() != current.hash or not self.meets_difficulty(current.hash, current.difficulty):
                 return False
             if current.cumulative_work:
                 if current.index == prev.index + 1 and prev.cumulative_work:
@@ -402,7 +467,13 @@ class Blockchain:
     def apply_block(self, block: Block) -> bool:
         if block.index != self.height + 1 or block.previous_hash != self.last_block.hash:
             return False
-        if block.compute_hash() != block.hash or not block.hash.startswith("0" * block.difficulty):
+        if block.previous_timestamp is None or block.previous_timestamp != self.last_block.timestamp:
+            return False
+        if block.timestamp <= self.last_block.timestamp or block.timestamp > time.time() + 7200:
+            return False
+        if not math.isclose(float(block.difficulty), self.calculate_next_difficulty(), rel_tol=0.0, abs_tol=1e-6):
+            return False
+        if block.compute_hash() != block.hash or not self.meets_difficulty(block.hash, block.difficulty):
             return False
         state = dict(self.balances)
         self._apply_transactions(state, block.transactions)
