@@ -33,10 +33,13 @@ class Transaction(BaseModel):
 class Block(BaseModel):
     index: int
     timestamp: float
+    # Timestamp of the parent block. Stored in each new block so per-block
+    # difficulty adjustment still works after older blocks are pruned.
+    previous_timestamp: Optional[float] = None
     transactions: List[Transaction] = []
     previous_hash: str
     nonce: int = 0
-    difficulty: int = 4
+    difficulty: float = 4.0
     hash: str = ""
     merkle_root: str = ""
     # Present only on pruning checkpoints; commits to the post-block account state.
@@ -69,9 +72,12 @@ class Block(BaseModel):
             "previous_hash": self.previous_hash,
             "merkle_root": self.merkle_root,
             "nonce": self.nonce,
-            "difficulty": self.difficulty,
+            "difficulty": (int(self.difficulty) if float(self.difficulty).is_integer()
+                           else round(float(self.difficulty), 6)),
         }
         # Omit these fields for legacy blocks so their historical hashes remain valid.
+        if self.previous_timestamp is not None:
+            header["previous_timestamp"] = self.previous_timestamp
         if self.snapshot_root:
             header["snapshot_root"] = self.snapshot_root
             header["snapshot_accounts"] = self.snapshot_accounts
@@ -85,10 +91,12 @@ class Block(BaseModel):
         return {
             "index": self.index,
             "timestamp": self.timestamp,
+            "previous_timestamp": self.previous_timestamp,
             "transactions": [tx.to_dict() for tx in self.transactions],
             "previous_hash": self.previous_hash,
             "nonce": self.nonce,
-            "difficulty": self.difficulty,
+            "difficulty": (int(self.difficulty) if float(self.difficulty).is_integer()
+                           else round(float(self.difficulty), 6)),
             "hash": self.hash,
             "merkle_root": self.merkle_root,
             "snapshot_root": self.snapshot_root,
