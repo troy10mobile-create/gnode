@@ -9,7 +9,7 @@ from app.blockchain.chain import Blockchain
 from app.wallet.wallet import Wallet
 from app.network.p2p import PeerManager
 from app.network.discovery import DiscoveryClient
-from app.config import PRUNE_INTERVAL
+from app.config import PRUNE_INTERVAL, INITIAL_DIFFICULTY
 
 router = APIRouter()
 
@@ -40,8 +40,8 @@ class SendTxRequest(BaseModel):
 @router.get("/api/status")
 async def get_status():
     next_height = blockchain.height + 1 if blockchain else 1
-    current_diff = blockchain.get_current_difficulty() if blockchain else 4
-    next_diff = blockchain.calculate_next_difficulty() if blockchain else 4
+    current_diff = blockchain.get_current_difficulty() if blockchain else INITIAL_DIFFICULTY
+    next_diff = blockchain.calculate_next_difficulty() if blockchain else INITIAL_DIFFICULTY
     return {
         "service": "Blockchain Node",
         "version": "0.3.0",
@@ -144,6 +144,7 @@ async def receive_block(block_data: dict):
         block = Block(
             index=block_data["index"],
             timestamp=block_data["timestamp"],
+            previous_timestamp=block_data.get("previous_timestamp"),
             transactions=txs,
             previous_hash=block_data["previous_hash"],
             nonce=block_data["nonce"],
